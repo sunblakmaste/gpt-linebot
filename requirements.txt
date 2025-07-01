@@ -4,3 +4,4 @@ line-bot-sdk
 openai>=1.0.0
 pymongo
 python-dotenv
+pytz
