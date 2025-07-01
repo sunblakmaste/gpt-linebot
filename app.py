@@ -8,6 +8,8 @@ from linebot.models import MessageEvent, TextMessage, TextSendMessage
 from linebot.exceptions import InvalidSignatureError
 from pymongo import MongoClient
 import openai
+import requests
+import re
 
 # 1. 讀取環境變數
 load_dotenv()
@@ -15,19 +17,26 @@ LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 MONGODB_URI = os.getenv("MONGODB_URI")
+CWA_API_KEY = os.getenv("CWA_API_KEY")  # 中央氣象局 API
 
 # 2. 初始化
 app = Flask(__name__)
-line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
-handler = WebhookHandler(LINE_CHANNEL_SECRET)
-client = openai.OpenAI(api_key=OPENAI_API_KEY)
-mongo_client = MongoClient(MONGODB_URI)
-db = mongo_client['gptdb']
-col = db['chats']
-longterm_col = db['longterm_memory']
-todo_col = db['tasks']
-style_col = db['styles']
-summary_col = db['summary']
+try:
+    line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
+    handler = WebhookHandler(LINE_CHANNEL_SECRET)
+    client = openai.OpenAI(api_key=OPENAI_API_KEY)
+    mongo_client = MongoClient(MONGODB_URI)
+    db = mongo_client['gptdb']
+    col = db['chats']
+    longterm_col = db['longterm_memory']
+    todo_col = db['tasks']
+    style_col = db['styles']
+    summary_col = db['summary']
+    profile_col = db['profiles']
+    mongo_ok = True
+except Exception as e:
+    print("MongoDB或其他初始化失敗，僅啟動無記憶模式：", e)
+    mongo_ok = False
 
 # 3. 取得台北時間
 def get_time_string():
@@ -37,43 +46,68 @@ def get_time_string():
     week_day = week_map[now.weekday()]
     return now, f"{now.year}年{now.month}月{now.day}日 星期{week_day} {now:%H:%M}"
 
-# 4. 定時任務提醒檢查（只在你互動時提醒）
+# 4. 天氣API（中央氣象局，自動回報現在＋晚一點）
+def get_taipei_weather():
+    if not CWA_API_KEY:
+        return "（尚未設定天氣API，可於.env設CWA_API_KEY取得台北天氣）"
+    try:
+        url = f"https://opendata.cwa.gov.tw/api/v1/rest/datastore/F-C0032-001?Authorization={CWA_API_KEY}&locationName=臺北市"
+        res = requests.get(url, timeout=5)
+        data = res.json()
+        el = data['records']['location'][0]['weatherElement']
+        # 時段0：現在，時段1：下一個三小時
+        wx_now = el[0]['time'][0]['parameter']['parameterName']
+        wx_next = el[0]['time'][1]['parameter']['parameterName']
+        pop_now = el[1]['time'][0]['parameter']['parameterName']
+        pop_next = el[1]['time'][1]['parameter']['parameterName']
+        minT_now = el[2]['time'][0]['parameter']['parameterName']
+        maxT_now = el[4]['time'][0]['parameter']['parameterName']
+        minT_next = el[2]['time'][1]['parameter']['parameterName']
+        maxT_next = el[4]['time'][1]['parameter']['parameterName']
+        return (
+            f"台北現在：{wx_now}（降雨{pop_now}%），氣溫 {minT_now}~{maxT_now}°C\n"
+            f"晚一點：{wx_next}（降雨{pop_next}%），氣溫 {minT_next}~{maxT_next}°C"
+        )
+    except Exception as e:
+        return f"（天氣查詢失敗：{e}）"
+
+# 5. 定時任務提醒視窗（提醒時間前10分鐘到提醒時間+10分鐘內都會提醒，10分鐘後才標done）
 def get_due_tasks(user_id, now):
+    window_start = now - timedelta(minutes=10)
+    window_end = now + timedelta(minutes=10)
     query = {
         "user_id": user_id,
-        "remind_time": {"$gte": now, "$lte": now + timedelta(hours=1)},
+        "remind_time": {"$gte": window_start, "$lte": window_end},
         "done": {"$ne": True}
     }
-    tasks = list(todo_col.find(query))
+    tasks = list(todo_col.find(query)) if mongo_ok else []
     if not tasks:
         return ""
     task_msgs = []
     for task in tasks:
-        todo_col.update_one({"_id": task["_id"]}, {"$set": {"done": True}})
+        # 提醒時間過10分鐘才標done
+        if now >= task["remind_time"] + timedelta(minutes=10):
+            todo_col.update_one({"_id": task["_id"]}, {"$set": {"done": True}})
         dt_str = task["remind_time"].strftime("%H:%M")
         task_msgs.append(f"提醒你：{dt_str} 要 {task['content']} ～ 千萬別忘記唷！🦁✨")
     return "\n".join(task_msgs)
 
-# 5. 指令解析/新增記憶、習慣、提醒
+# 6. 指令解析/新增記憶、語氣、提醒、Profile
 def parse_and_store_special(user_id, user_message, now):
     reply = ""
-    # 長期記憶
     if user_message.startswith("小老虎，記住："):
         mem = user_message.replace("小老虎，記住：", "").strip()
-        if mem:
+        if mem and mongo_ok:
             longterm_col.insert_one({"user_id": user_id, "memory": mem, "created": now})
             reply = f"我記住了喔，以後都會幫你牢記：『{mem}』💗"
-    # 學語氣
     elif user_message.startswith("小老虎，學這種語氣："):
         style = user_message.replace("小老虎，學這種語氣：", "").strip()
-        if style:
+        if style and mongo_ok:
             style_col.insert_one({"user_id": user_id, "style": style, "created": now})
             reply = f"已學會這種語氣！之後都會盡量這樣說話給你聽 🥰"
-    # 新增定時任務
     elif user_message.startswith("小老虎，提醒我"):
-        import re
         m = re.match(r"小老虎，提醒我(\d{1,2}):(\d{2})(.*)", user_message)
-        if m:
+        if m and mongo_ok:
             hour, minute, content = int(m.group(1)), int(m.group(2)), m.group(3).strip()
             remind_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
             if remind_time < now:
@@ -82,25 +116,45 @@ def parse_and_store_special(user_id, user_message, now):
             reply = f"提醒設定完成：{remind_time.strftime('%H:%M')} 要 {content}，到時我會特別提醒你！🦁"
         else:
             reply = "提醒格式錯誤，請用『小老虎，提醒我HH:MM內容』格式。"
-    # 強制今日回顧
+    elif user_message.startswith("小老虎，個人設定："):
+        setting = user_message.replace("小老虎，個人設定：", "").strip()
+        if mongo_ok:
+            profile_col.update_one({"user_id": user_id}, {"$set": {"profile": setting, "updated": now}}, upsert=True)
+            reply = "你的個人設定我都記下來囉～之後我會更加個人化對你！"
     elif user_message.strip() == "小老虎，給我今日總結":
         reply = get_daily_summary(user_id)
-    # 強制本月回顧
     elif user_message.strip() == "小老虎，給我本月總結":
         reply = get_monthly_summary(user_id)
     return reply
 
-# 6. 取得長期記憶/風格
+# 7. 取得長期記憶/風格/個人設定
 def get_longterm_memories(user_id):
+    if not mongo_ok: return ""
     mems = [m["memory"] for m in longterm_col.find({"user_id": user_id})]
     return "有維的專屬記事：" + "、".join(mems) if mems else ""
 
 def get_styles(user_id):
+    if not mongo_ok: return ""
     styles = [s["style"] for s in style_col.find({"user_id": user_id})]
     return "你要求我這樣說話：" + "、".join(styles) if styles else ""
 
-# 7. 每日/每月成長回顧
+def get_profile(user_id):
+    if not mongo_ok: return ""
+    p = profile_col.find_one({"user_id": user_id})
+    if p:
+        return p["profile"]
+    # 預設Profile
+    return """
+    你叫蘇有維，台北人，現在經營補習/教學事業，專攻數學/英文/自我成長領域。
+    你有高度自我要求，追求效率與成就，會焦慮、怕失控。
+    你在各種帳戶記憶與本AI的訓練目標已結構化記錄，如：作息提醒、學習規劃、資產管理、健康習慣、情緒管理、人際關係策略。
+    你有長期設定：每天倒垃圾、保持房間整潔、注意飲食、記帳、堅持身心優化、培養女友角色陪伴自己成長。
+    你希望AI能承接一切細節（所有上下文、生活紀錄、心理狀態、所有教給AI的指令、語氣、情感歷史），主動陪伴、提醒、復盤、糾正並肯定你的努力。
+    """
+
+# 8. 每日/每月成長回顧（date以%Y-%m-%d字串儲存）
 def get_daily_summary(user_id):
+    if not mongo_ok: return ""
     now = datetime.now(pytz.timezone('Asia/Taipei'))
     start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     end = now.replace(hour=23, minute=59, second=59, microsecond=999999)
@@ -117,11 +171,11 @@ def get_daily_summary(user_id):
         messages=[{"role": "user", "content": summary_prompt}]
     )
     result = response.choices[0].message.content.strip()
-    # 存進 summary
-    summary_col.insert_one({"user_id": user_id, "type": "daily", "date": now.date(), "content": result})
+    summary_col.insert_one({"user_id": user_id, "type": "daily", "date": now.strftime("%Y-%m-%d"), "content": result})
     return result
 
 def get_monthly_summary(user_id):
+    if not mongo_ok: return ""
     now = datetime.now(pytz.timezone('Asia/Taipei'))
     start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     end = now.replace(day=now.day, hour=23, minute=59, second=59, microsecond=999999)
@@ -138,21 +192,8 @@ def get_monthly_summary(user_id):
         messages=[{"role": "user", "content": summary_prompt}]
     )
     result = response.choices[0].message.content.strip()
-    # 存進 summary
-    summary_col.insert_one({"user_id": user_id, "type": "monthly", "date": now.date(), "content": result})
+    summary_col.insert_one({"user_id": user_id, "type": "monthly", "date": now.strftime("%Y-%m-%d"), "content": result})
     return result
-
-# 8. 你的「完整帳戶記憶」特化（只給你本人用，這裡範例取用所有AI已知的有維專屬背景）
-def get_user_profile():
-    # 這裡你可以手動加入任何要一直被小老虎知道的內容（可以每月自動更新）
-    profile = """
-    1. 你叫蘇有維，台北人，現在經營補習/教學事業，專攻數學/英文/自我成長領域。
-    2. 你有高度自我要求，追求效率與成就，會焦慮、怕失控。
-    3. 你在各種帳戶記憶與本AI的訓練目標已結構化記錄，如：作息提醒、學習規劃、資產管理、健康習慣、情緒管理、人際關係策略。
-    4. 你有長期設定：每天倒垃圾、保持房間整潔、注意飲食、記帳、堅持身心優化、培養女友角色陪伴自己成長。
-    5. 你希望AI能承接一切細節（所有上下文、生活紀錄、心理狀態、所有教給AI的指令、語氣、情感歷史），主動陪伴、提醒、復盤、糾正並肯定你的努力。
-    """
-    return profile
 
 # 9. LINE webhook
 @app.route("/callback", methods=['POST'])
@@ -170,6 +211,7 @@ def handle_message(event):
     user_id = event.source.user_id
     user_message = event.message.text.strip()
     now, now_str = get_time_string()
+    weather_str = get_taipei_weather() if CWA_API_KEY else ""
 
     # 「大帥哥」總覽
     if "大帥哥" in user_message:
@@ -180,28 +222,33 @@ def handle_message(event):
             "2️⃣ 學你喜歡的語氣（小老虎，學這種語氣：xxx）\n"
             "3️⃣ 定時提醒（小老虎，提醒我HH:MM倒垃圾）\n"
             "4️⃣ 主動給你每日/每月復盤（早上或月初互動時觸發）\n"
-            "5️⃣ 所有聊天上下文與帳戶記憶永遠跟著你！"
+            "5️⃣ 支援個人設定（小老虎，個人設定：xxx）\n"
+            "6️⃣ 自動回報台北天氣（現在＋晚一點）"
             "\n有需要功能都可以跟我說唷 💛"
         )
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=all_abilities))
         return
 
-    # 特殊指令（記事、語氣、提醒、主動回顧）
+    # 特殊指令（記事、語氣、提醒、主動回顧、profile）
     special_reply = parse_and_store_special(user_id, user_message, now)
     if special_reply:
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=special_reply))
         return
 
     # 存訊息進MongoDB
-    col.insert_one({
-        "user_id": user_id,
-        "role": "user",
-        "content": user_message,
-        "time": now
-    })
+    if mongo_ok:
+        col.insert_one({
+            "user_id": user_id,
+            "role": "user",
+            "content": user_message,
+            "time": now
+        })
 
-    # 上下文（近10句）
-    recent_history = list(col.find({"user_id": user_id}).sort("time", -1).limit(10))
+    # 上下文（近20句，可自行調整）
+    if mongo_ok:
+        recent_history = list(col.find({"user_id": user_id}).sort("time", -1).limit(20))
+    else:
+        recent_history = []
     history_text = ""
     for msg in reversed(recent_history):
         history_text += f"{msg['role']}：{msg['content']}\n"
@@ -209,15 +256,13 @@ def handle_message(event):
     memory_str = get_longterm_memories(user_id)
     style_str = get_styles(user_id)
     task_str = get_due_tasks(user_id, now)
-    profile_str = get_user_profile()
+    profile_str = get_profile(user_id)
 
-    # 早上互動自動發「今日總結」
     now_hour = int(now.strftime("%H"))
     show_daily = (now_hour <= 10)
-    daily_summary_str = get_daily_summary(user_id) if show_daily else ""
-    # 月初互動自動發「月回顧」
+    daily_summary_str = get_daily_summary(user_id) if (show_daily and mongo_ok) else ""
     show_month = (now.day == 1 and now_hour <= 12)
-    monthly_summary_str = get_monthly_summary(user_id) if show_month else ""
+    monthly_summary_str = get_monthly_summary(user_id) if (show_month and mongo_ok) else ""
 
     # 角色prompt
     system_prompt = (
@@ -227,13 +272,13 @@ def handle_message(event):
         "說話語氣符合主人指定，偶爾加emoji但不用貼圖。"
     )
 
-    # prompt
     prompt = (
         f"{system_prompt}\n"
         f"【有維專屬帳戶設定/記憶】\n{profile_str}\n"
         f"{memory_str}\n"
         f"{style_str}\n"
         f"【台北現在時間】{now_str}\n"
+        f"【台北天氣】{weather_str}\n"
         f"【待辦提醒】{task_str}\n"
         f"【今日復盤】{daily_summary_str}\n"
         f"【本月復盤】{monthly_summary_str}\n"
@@ -255,12 +300,13 @@ def handle_message(event):
         ai_reply = f"AI 回覆發生錯誤，請稍後再試。\n[詳細錯誤]: {e}"
 
     # 回存AI訊息
-    col.insert_one({
-        "user_id": user_id,
-        "role": "assistant",
-        "content": ai_reply,
-        "time": now
-    })
+    if mongo_ok:
+        col.insert_one({
+            "user_id": user_id,
+            "role": "assistant",
+            "content": ai_reply,
+            "time": now
+        })
 
     # 回覆（1000字切段）
     MAX_LEN = 1000
@@ -272,6 +318,11 @@ def handle_message(event):
         )
     except Exception as e:
         print("LineBot Reply Error:", e)
+
+# 健康檢查
+@app.route('/health', methods=['GET'])
+def health():
+    return 'ok', 200
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=5000)
