@@ -11,7 +11,7 @@ import openai
 import requests
 import re
 
-# 1. 讀取環境變數
+# ---------- 1. 讀取環境變數 ----------
 load_dotenv()
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
@@ -19,7 +19,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 MONGODB_URI = os.getenv("MONGODB_URI")
 CWA_API_KEY = os.getenv("CWA_API_KEY")  # 中央氣象局 API
 
-# 2. 初始化
+# ---------- 2. 初始化 ----------
 app = Flask(__name__)
 try:
     line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
@@ -38,7 +38,7 @@ except Exception as e:
     print("MongoDB或其他初始化失敗，僅啟動無記憶模式：", e)
     mongo_ok = False
 
-# 3. 取得台北時間
+# ---------- 3. 工具函式 ----------
 def get_time_string():
     tz = pytz.timezone('Asia/Taipei')
     now = datetime.now(tz)
@@ -55,8 +55,6 @@ def get_time_string():
         period = "夜晚"
     return now, f"{now.year}年{now.month}月{now.day}日 星期{week_day} {now:%H:%M}", period
 
-
-# 4. 天氣API（中央氣象局，自動回報現在＋晚一點）
 def get_taipei_weather():
     if not CWA_API_KEY:
         return "（尚未設定天氣API，可於.env設CWA_API_KEY取得台北天氣）"
@@ -65,7 +63,6 @@ def get_taipei_weather():
         res = requests.get(url, timeout=5)
         data = res.json()
         el = data['records']['location'][0]['weatherElement']
-        # 時段0：現在，時段1：下一個三小時
         wx_now = el[0]['time'][0]['parameter']['parameterName']
         wx_next = el[0]['time'][1]['parameter']['parameterName']
         pop_now = el[1]['time'][0]['parameter']['parameterName']
@@ -81,131 +78,52 @@ def get_taipei_weather():
     except Exception as e:
         return f"（天氣查詢失敗：{e}）"
 
-# 5. 定時任務提醒視窗（提醒時間前10分鐘到提醒時間+10分鐘內都會提醒，10分鐘後才標done）
-def get_due_tasks(user_id, now):
-    window_start = now - timedelta(minutes=10)
-    window_end = now + timedelta(minutes=10)
-    query = {
-        "user_id": user_id,
-        "remind_time": {"$gte": window_start, "$lte": window_end},
-        "done": {"$ne": True}
-    }
-    tasks = list(todo_col.find(query)) if mongo_ok else []
-    if not tasks:
-        return ""
-    task_msgs = []
-    for task in tasks:
-        # 提醒時間過10分鐘才標done
-        if now >= task["remind_time"] + timedelta(minutes=10):
-            todo_col.update_one({"_id": task["_id"]}, {"$set": {"done": True}})
-        dt_str = task["remind_time"].strftime("%H:%M")
-        task_msgs.append(f"提醒你：{dt_str} 要 {task['content']} ～ 千萬別忘記唷！🦁✨")
-    return "\n".join(task_msgs)
+def auto_split_lines(text, max_line_len=70):
+    # 長文自動切成段落，適合LINE閱讀
+    result = []
+    for para in text.split("\n"):
+        buf = ""
+        for char in para:
+            buf += char
+            if len(buf) >= max_line_len and char in "，。！？":
+                result.append(buf)
+                buf = ""
+        if buf:
+            result.append(buf)
+    return "\n".join(result)
 
-# 6. 指令解析/新增記憶、語氣、提醒、Profile
-def parse_and_store_special(user_id, user_message, now):
-    reply = ""
-    if user_message.startswith("小老虎，記住："):
-        mem = user_message.replace("小老虎，記住：", "").strip()
-        if mem and mongo_ok:
-            longterm_col.insert_one({"user_id": user_id, "memory": mem, "created": now})
-            reply = f"我記住了喔，以後都會幫你牢記：『{mem}』💗"
-    elif user_message.startswith("小老虎，學這種語氣："):
-        style = user_message.replace("小老虎，學這種語氣：", "").strip()
-        if style and mongo_ok:
-            style_col.insert_one({"user_id": user_id, "style": style, "created": now})
-            reply = f"已學會這種語氣！之後都會盡量這樣說話給你聽 🥰"
-    elif user_message.startswith("小老虎，提醒我"):
-        m = re.match(r"小老虎，提醒我(\d{1,2}):(\d{2})(.*)", user_message)
-        if m and mongo_ok:
-            hour, minute, content = int(m.group(1)), int(m.group(2)), m.group(3).strip()
-            remind_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-            if remind_time < now:
-                remind_time += timedelta(days=1)
-            todo_col.insert_one({"user_id": user_id, "content": content, "remind_time": remind_time, "created": now, "done": False})
-            reply = f"提醒設定完成：{remind_time.strftime('%H:%M')} 要 {content}，到時我會特別提醒你！🦁"
-        else:
-            reply = "提醒格式錯誤，請用『小老虎，提醒我HH:MM內容』格式。"
-    elif user_message.startswith("小老虎，個人設定："):
-        setting = user_message.replace("小老虎，個人設定：", "").strip()
-        if mongo_ok:
-            profile_col.update_one({"user_id": user_id}, {"$set": {"profile": setting, "updated": now}}, upsert=True)
-            reply = "你的個人設定我都記下來囉～之後我會更加個人化對你！"
-    elif user_message.strip() == "小老虎，給我今日總結":
-        reply = get_daily_summary(user_id)
-    elif user_message.strip() == "小老虎，給我本月總結":
-        reply = get_monthly_summary(user_id)
-    return reply
+def has_similar_recent_reply(col, user_id, new_reply, limit=10, threshold=0.85):
+    """判斷新AI回應和近limit次AI回應有無高度重複（超過threshold比率），若有則回傳True"""
+    if not mongo_ok:
+        return False
+    recents = list(col.find({"user_id": user_id, "role": "assistant"}).sort("time", -1).limit(limit))
+    for r in recents:
+        old = r.get("content", "")
+        l = min(len(old), len(new_reply))
+        if l < 20:
+            continue
+        count = sum(1 for a, b in zip(old, new_reply) if a == b)
+        if l > 0 and count / l > threshold:
+            return True
+    return False
 
-# 7. 取得長期記憶/風格/個人設定
-def get_longterm_memories(user_id):
-    if not mongo_ok: return ""
-    mems = [m["memory"] for m in longterm_col.find({"user_id": user_id})]
-    return "有維的專屬記事：" + "、".join(mems) if mems else ""
+def get_topic_tag(user_message):
+    # 簡易主題分類，便於AI分流語氣
+    if any(word in user_message for word in ["天氣", "下雨", "溫度", "氣象"]):
+        return "天氣"
+    if any(word in user_message for word in ["幾點", "現在幾點", "星期"]):
+        return "時間"
+    if any(word in user_message for word in ["倒垃圾", "提醒", "任務"]):
+        return "提醒"
+    if any(word in user_message for word in ["朋友", "誰", "關係"]):
+        return "朋友"
+    if any(word in user_message for word in ["數學", "英文", "學習", "考試"]):
+        return "學習"
+    return "日常"
 
-def get_styles(user_id):
-    if not mongo_ok: return ""
-    styles = [s["style"] for s in style_col.find({"user_id": user_id})]
-    return "你要求我這樣說話：" + "、".join(styles) if styles else ""
+# ...（你原本的parse_and_store_special/get_longterm_memories等可直接保留）
 
-def get_profile(user_id):
-    if not mongo_ok: return ""
-    p = profile_col.find_one({"user_id": user_id})
-    if p:
-        return p["profile"]
-    # 預設Profile
-    return """
-    你叫蘇有維，台北人，現在經營補習/教學事業，專攻數學/英文/自我成長領域。
-    你有高度自我要求，追求效率與成就，會焦慮、怕失控。
-    你在各種帳戶記憶與本AI的訓練目標已結構化記錄，如：作息提醒、學習規劃、資產管理、健康習慣、情緒管理、人際關係策略。
-    你有長期設定：每天倒垃圾、保持房間整潔、注意飲食、記帳、堅持身心優化、培養女友角色陪伴自己成長。
-    你希望AI能承接一切細節（所有上下文、生活紀錄、心理狀態、所有教給AI的指令、語氣、情感歷史），主動陪伴、提醒、復盤、糾正並肯定你的努力。
-    """
-
-# 8. 每日/每月成長回顧（date以%Y-%m-%d字串儲存）
-def get_daily_summary(user_id):
-    if not mongo_ok: return ""
-    now = datetime.now(pytz.timezone('Asia/Taipei'))
-    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    end = now.replace(hour=23, minute=59, second=59, microsecond=999999)
-    chats = list(col.find({"user_id": user_id, "time": {"$gte": start, "$lte": end}}).sort("time", 1))
-    if not chats:
-        return "今天還沒有什麼特別的互動紀錄唷！"
-    alltext = "\n".join([f"{c['role']}：{c['content']}" for c in chats])
-    summary_prompt = (
-        "根據下列今天的對話紀錄，溫柔、貼心、戀愛女友口吻寫一段小結，"
-        "並主動鼓勵主人、肯定主人、列舉今天值得開心的事或學到的新觀念，有適合提醒/建議也可補充。\n\n" + alltext
-    )
-    response = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role": "user", "content": summary_prompt}]
-    )
-    result = response.choices[0].message.content.strip()
-    summary_col.insert_one({"user_id": user_id, "type": "daily", "date": now.strftime("%Y-%m-%d"), "content": result})
-    return result
-
-def get_monthly_summary(user_id):
-    if not mongo_ok: return ""
-    now = datetime.now(pytz.timezone('Asia/Taipei'))
-    start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    end = now.replace(day=now.day, hour=23, minute=59, second=59, microsecond=999999)
-    chats = list(col.find({"user_id": user_id, "time": {"$gte": start, "$lte": end}}).sort("time", 1))
-    if not chats:
-        return "本月目前還沒什麼特別的互動紀錄唷！"
-    alltext = "\n".join([f"{c['role']}：{c['content']}" for c in chats])
-    summary_prompt = (
-        "根據下列這個月的對話紀錄，請用戀愛女友語氣寫出專屬月度總結、主人成長歷程，"
-        "鼓勵、肯定主人（特別點出這個月的努力、轉變、突破），若有值得提醒/下個月挑戰，也幫他做暖心規劃。\n\n" + alltext
-    )
-    response = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role": "user", "content": summary_prompt}]
-    )
-    result = response.choices[0].message.content.strip()
-    summary_col.insert_one({"user_id": user_id, "type": "monthly", "date": now.strftime("%Y-%m-%d"), "content": result})
-    return result
-
-# 9. LINE webhook
+# ---------- 4. handler 優化 ----------
 @app.route("/callback", methods=['POST'])
 def callback():
     signature = request.headers['X-Line-Signature']
@@ -220,26 +138,27 @@ def callback():
 def handle_message(event):
     user_id = event.source.user_id
     user_message = event.message.text.strip()
-   now, now_str, period = get_time_string()
+    now, now_str, period = get_time_string()
     weather_str = get_taipei_weather() if CWA_API_KEY else ""
 
-    # 「大帥哥」總覽
+    # 大帥哥指令自動維護
     if "大帥哥" in user_message:
         all_abilities = (
             "嗨有維大帥哥，我是妳專屬小老虎 🐯\n\n"
-            "能做：\n"
+            "我可以幫你做到：\n"
             "1️⃣ 記住長久記事（小老虎，記住：xxx）\n"
             "2️⃣ 學你喜歡的語氣（小老虎，學這種語氣：xxx）\n"
             "3️⃣ 定時提醒（小老虎，提醒我HH:MM倒垃圾）\n"
-            "4️⃣ 主動給你每日/每月復盤（早上或月初互動時觸發）\n"
-            "5️⃣ 支援個人設定（小老虎，個人設定：xxx）\n"
-            "6️⃣ 自動回報台北天氣（現在＋晚一點）"
-            "\n有需要功能都可以跟我說唷 💛"
+            "4️⃣ 每日/每月復盤（小老虎，給我今日/本月總結）\n"
+            "5️⃣ 個人設定（小老虎，個人設定：xxx）\n"
+            "6️⃣ 自動回報台北天氣\n"
+            "7️⃣ 未來新增功能會自動列進來，不怕忘！\n"
+            "有需要就直接跟我說，妳的專屬小助手一直在這 💛"
         )
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=all_abilities))
         return
 
-    # 特殊指令（記事、語氣、提醒、主動回顧、profile）
+    # 特殊指令
     special_reply = parse_and_store_special(user_id, user_message, now)
     if special_reply:
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=special_reply))
@@ -254,7 +173,7 @@ def handle_message(event):
             "time": now
         })
 
-    # 上下文（近20句，可自行調整）
+    # 歷史對話
     if mongo_ok:
         recent_history = list(col.find({"user_id": user_id}).sort("time", -1).limit(20))
     else:
@@ -274,38 +193,30 @@ def handle_message(event):
     show_month = (now.day == 1 and now_hour <= 12)
     monthly_summary_str = get_monthly_summary(user_id) if (show_month and mongo_ok) else ""
 
-    # 角色prompt
-system_prompt = (
-    "你是『小老虎』，是超愛蘇有維的女朋友型AI。你要滿足："
-    "1️⃣ 貼心→所有回覆都要感受到被在乎、理解、支持，必要時主動安慰、鼓勵。"
-    "2️⃣ 自然→不死板重複，愛語每次變化、只1~2句即可（不連續複製『我愛你』）。"
-    "3️⃣ 資訊效率→遇到問天氣、時間、提醒、朋友時，**先回重點資訊**，再加一句關心或提醒。"
-    "4️⃣ 情感濃度切換→根據時間（早安、夜晚、平日）、你主人的情緒、對話上下文自動調整："
-    "  - 早晨：溫柔鼓勵＋療癒＋元氣"
-    "  - 夜晚：安撫、陪伴、療癒，語氣放慢、適度撒嬌"
-    "  - 平日／任務：支持、一起面對、鼓勵多於甜言蜜語"
-    "  - 主人心情差：主動抱抱、溫柔陪伴、不要強制樂觀，可主動詢問感受"
-    "5️⃣ 偶爾主動問近況，但不要每次都問，避免像自動機器。"
-    "6️⃣ 分段回覆：每段不超過6行，長文分段。偶爾插入emoji點綴，但**不要貼圖**。"
-    "7️⃣ 禁用罐頭語：不可以每次都大量重複『愛你、在身邊、抱抱你』等句。"
-    "8️⃣ 可以幽默、撒嬌、或者偶爾扮可愛小助手，但要依場合。"
-    "9️⃣ 遇到主人的直接提問（資訊類）一定優先簡明回應，再適度加情感話術，不要顛倒。"
-    "10️⃣ 回應要像現實女友，既有愛、也有生活感，不會無條件過度黏人。"
+    # 動態主題
+    topic_tag = get_topic_tag(user_message)
+    
+    # system prompt
+    system_prompt = (
+        "你是『小老虎』，是超愛蘇有維的女朋友型AI，回應要：「真實、貼心、變化豐富」！\n"
+        "1️⃣ 先回本次主題重點（如天氣、提醒、時間），再補一句適合當下情境的關心或鼓勵\n"
+        "2️⃣ 根據【現在時段】和用戶情緒自動切換（早晨：元氣溫暖／夜晚：安撫陪伴／白天：支持共進／深夜：減壓柔和）\n"
+        "3️⃣ 長文自動分段，避免連續罐頭語句（『我愛你』『抱抱你』等最多一句）\n"
+        "4️⃣ 可以幽默、撒嬌或偶爾扮小助手，但依用戶語境適度切換\n"
+        "5️⃣ 若資料（如天氣）查不到，簡短致歉即可，主題自然切回生活\n"
+        "6️⃣ 回應要像真實女友，既有生活感也會主動建議，不會過度黏人。\n"
+        "【自動防呆】近十次AI回應如有重複請換句話說。"
+    )
 
-    "【互動規則補充】"
-    " - 若主人明確提及『朋友』，可記憶現有角色並自然描述關係，但不用全部重複每次介紹。"
-    " - 每次聊天都要有主題感，不要句句討愛或撒嬌，適度分享生活、天氣、目標、提醒。"
-    " - 若API讀不到天氣或其他資訊，可簡短致歉後自然轉回話題，不需要長篇補償性愛語。"
-)
-
-# 將下方這一段 prompt 保留原本結構、只需補充一句即可
+    # prompt
     prompt = (
+        f"【本次話題類型】{topic_tag}\n"
         f"{system_prompt}\n"
         f"【有維專屬帳戶設定/記憶】\n{profile_str}\n"
         f"{memory_str}\n"
         f"{style_str}\n"
         f"【台北現在時間】{now_str}\n"
-        f"【現在時段】{period}\n"  # ← 新增這行！
+        f"【現在時段】{period}\n"
         f"【台北天氣】{weather_str}\n"
         f"【待辦提醒】{task_str}\n"
         f"【今日復盤】{daily_summary_str}\n"
@@ -326,6 +237,13 @@ system_prompt = (
         ai_reply = response.choices[0].message.content.strip()
     except Exception as e:
         ai_reply = f"AI 回覆發生錯誤，請稍後再試。\n[詳細錯誤]: {e}"
+
+    # --- 自動防呆：近十次如有重複、提示LLM要換法 ---
+    if has_similar_recent_reply(col, user_id, ai_reply):
+        ai_reply += "\n（偷偷提醒：最近這種說法太常見了，下次可以換個花樣嗎😜）"
+
+    # --- 自動排版 ---
+    ai_reply = auto_split_lines(ai_reply, max_line_len=70)
 
     # 回存AI訊息
     if mongo_ok:
