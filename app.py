@@ -55,6 +55,7 @@ def get_time_string():
         period = "夜晚"
     return now, f"{now.year}年{now.month}月{now.day}日 星期{week_day} {now:%H:%M}", period
 
+
 # 4. 天氣API（中央氣象局，自動回報現在＋晚一點）
 def get_taipei_weather():
     if not CWA_API_KEY:
@@ -219,7 +220,7 @@ def callback():
 def handle_message(event):
     user_id = event.source.user_id
     user_message = event.message.text.strip()
-    now, now_str = get_time_string()
+   now, now_str, period = get_time_string()
     weather_str = get_taipei_weather() if CWA_API_KEY else ""
 
     # 「大帥哥」總覽
@@ -298,19 +299,20 @@ system_prompt = (
 )
 
 # 將下方這一段 prompt 保留原本結構、只需補充一句即可
-prompt = (
-    f"{system_prompt}\n"
-    f"【有維專屬帳戶設定/記憶】\n{profile_str}\n"
-    f"{memory_str}\n"
-    f"{style_str}\n"
-    f"【台北現在時間】{now_str}\n"
-    f"【台北天氣】{weather_str}\n"
-    f"【待辦提醒】{task_str}\n"
-    f"【今日復盤】{daily_summary_str}\n"
-    f"【本月復盤】{monthly_summary_str}\n"
-    f"【歷史對話】\n{history_text}\n"
-    "直接用上面定義的風格回覆蘇有維，維持真實女友的溫度與智慧。"
-)
+    prompt = (
+        f"{system_prompt}\n"
+        f"【有維專屬帳戶設定/記憶】\n{profile_str}\n"
+        f"{memory_str}\n"
+        f"{style_str}\n"
+        f"【台北現在時間】{now_str}\n"
+        f"【現在時段】{period}\n"  # ← 新增這行！
+        f"【台北天氣】{weather_str}\n"
+        f"【待辦提醒】{task_str}\n"
+        f"【今日復盤】{daily_summary_str}\n"
+        f"【本月復盤】{monthly_summary_str}\n"
+        f"【歷史對話】\n{history_text}\n"
+        "直接用上面定義的風格回覆蘇有維，維持真實女友的溫度與智慧。"
+    )
 
     # GPT
     try:
