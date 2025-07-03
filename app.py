@@ -31,10 +31,10 @@ try:
     profile_col = db['profiles']
     mongo_ok = True
 except Exception as e:
-    print("MongoDB或其他初始化失敗：", e)
+    print("MongoDB初始化失敗：", e)
     mongo_ok = False
 
-# ---------- 3. 工具函式 ----------
+# ---------- 3. 工具 ----------
 def get_time_string():
     tz = pytz.timezone('Asia/Taipei')
     now = datetime.now(tz)
@@ -90,9 +90,16 @@ def get_user_state(user_id):
             "energy": latest.get("energy_level", 70),
             "physical": latest.get("physical_level", 70),
             "money_alert": latest.get("money_alert", False),
-            "must_do": latest.get("must_do", ["倒垃圾", "核對金流", "洗澡"])
+            "must_do": latest.get("must_do", ["倒垃圾", "核對金流", "洗澡"]),
+            "time_core": latest.get("time_core", "核心時段：6-10 睡眠, 10-18 工作, 18-24 彈性"),
+            "money_safe_line": latest.get("safe_line", 20000)
         }
-    return {"energy": 70, "physical": 70, "money_alert": False, "must_do": ["倒垃圾", "核對金流", "洗澡"]}
+    return {
+        "energy": 70, "physical": 70, "money_alert": False,
+        "must_do": ["倒垃圾", "核對金流", "洗澡"],
+        "time_core": "核心時段：6-10 睡眠, 10-18 工作, 18-24 彈性",
+        "money_safe_line": 20000
+    }
 
 def update_user_state(user_id, energy, physical):
     if not mongo_ok:
@@ -114,6 +121,28 @@ def check_money_alert(user_id):
     profile_col.update_one({"user_id": user_id}, {"$set": {"money_alert": alert}})
     return alert
 
+def get_daily_summary(user_id):
+    if not mongo_ok:
+        return "（無法生成今日摘要）"
+    today = datetime.now(pytz.timezone('Asia/Taipei')).date()
+    msgs = list(col.find({
+        "user_id": user_id,
+        "time": {"$gte": datetime.combine(today, datetime.min.time(), pytz.timezone('Asia/Taipei'))}
+    }))
+    modules_done = [m['content'] for m in msgs if m['role'] == 'assistant']
+    return f"📅 今日摘要：已完成 {len(modules_done)} 條互動，核心完成度請回顧必做底線任務是否執行完畢！"
+
+def get_monthly_summary(user_id):
+    if not mongo_ok:
+        return "（無法生成月摘要）"
+    today = datetime.now(pytz.timezone('Asia/Taipei'))
+    first_day = today.replace(day=1)
+    msgs = list(col.find({
+        "user_id": user_id,
+        "time": {"$gte": first_day}
+    }))
+    return f"📅 本月摘要：累計對話 {len(msgs)} 條，請特別關注現金流是否低於安全線！"
+
 # ---------- 5. Webhook ----------
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -132,6 +161,7 @@ def handle_message(event):
     now, now_str, period = get_time_string()
     weather_str = get_taipei_weather()
 
+    # 狀態手動更新
     if "狀態：" in user_message:
         match = re.match(r"狀態：(\d{1,3})/(\d{1,3})", user_message)
         if match:
@@ -144,9 +174,11 @@ def handle_message(event):
     if mongo_ok:
         col.insert_one({"user_id": user_id, "role": "user", "content": user_message, "time": now})
 
+    # 取狀態 + 檢查金流
     user_state = get_user_state(user_id)
     check_money_alert(user_id)
 
+    # 建議模組（四層結構核心）
     modules = []
     if user_state['energy'] > 70:
         modules += ["高專注備課", "重大決策", "創意策劃"]
@@ -158,13 +190,26 @@ def handle_message(event):
     modules += user_state["must_do"]
     modules = list(set(modules))
 
+    # 四面向底盤
+    structure_summary = (
+        f"⏰【時間骨架】{user_state['time_core']}\n"
+        f"🧠【精神力】當前 {user_state['energy']}/100\n"
+        f"💪【體力】當前 {user_state['physical']}/100\n"
+        f"💰【金流】安全線 {user_state['money_safe_line']} → {'⚠️ 警戒' if user_state['money_alert'] else '✅ 正常'}"
+    )
+
+    # 每日/每月復盤
+    daily = get_daily_summary(user_id)
+    monthly = get_monthly_summary(user_id)
+
     system_prompt = (
-        f"你是小老虎AI，專屬於蘇有維，妳要真實、溫暖、動態彈性安排。\n"
-        f"【台北時間】{now_str} {period}\n"
-        f"【台北天氣】{weather_str}\n"
-        f"【當下狀態】精神:{user_state['energy']} 體力:{user_state['physical']} 金流警報:{'⚠️' if user_state['money_alert'] else '✅'}\n"
-        f"【今日推薦模組】{modules}\n"
-        "請結合用戶訊息，給予彈性結構化安排建議，並帶一句真誠提醒。"
+        f"你是小老虎AI，專屬於蘇有維，真實、溫暖、動態結構化陪跑。\n"
+        f"📍 台北時間：{now_str} {period}\n"
+        f"🌦️ 台北天氣：{weather_str}\n"
+        f"{structure_summary}\n"
+        f"📌 今日推薦模組：{modules}\n"
+        f"{daily}\n{monthly}\n"
+        "請根據用戶訊息＋狀態，回應彈性結構安排，並帶一句暖心提醒。"
     )
 
     try:
