@@ -85,10 +85,8 @@ def auto_split_lines(text, max_line_len=70):
 def get_user_state(user_id):
     if not mongo_ok:
         return {}
-    latest = profile_col.find_one({"user_id": user_id})
-    if latest:
-        return latest
-    return {}
+    data = profile_col.find_one({"user_id": user_id})
+    return data if data else {}
 
 def update_user_state(user_id, energy, physical):
     if not mongo_ok:
@@ -108,7 +106,7 @@ def check_money_alert(user_id):
     safe_line = data.get("safe_line", 20000)
     alert = (income - expense) < safe_line
     profile_col.update_one({"user_id": user_id}, {"$set": {"money_alert": alert}})
-    return alert, "⚡️ 建議啟動快現金模組！" if alert else ""
+    return alert, "⚡️ 金流警戒！啟動快現金模組！" if alert else ""
 
 def check_teaching_log_reminder(user_id):
     tz = pytz.timezone('Asia/Taipei')
@@ -117,7 +115,7 @@ def check_teaching_log_reminder(user_id):
     for log in logs:
         if log.get("date") == str(yesterday):
             return ""
-    return f"⚠️ 提醒：昨天（{yesterday}）沒登錄教學紀錄，要補上嗎？"
+    return f"⚠️ 提醒：昨天（{yesterday}）未登錄教學紀錄，需補上？"
 
 # ---------- 5. Webhook ----------
 @app.route("/callback", methods=['POST'])
@@ -158,9 +156,9 @@ def handle_message(event):
     if "請假" in user_message:
         found = [s['name'] for s in user_state.get('students', []) if s['name'] in user_message]
         if found:
-            total_unpaid = len(found) * 500  # 依需求可做更精確
+            total_unpaid = len(found) * 500  # 可依需求做更細緻計算
             profile_col.update_one({"user_id": user_id}, {"$inc": {"unpaid_this_month": total_unpaid}})
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(f"✅ 已紀錄請假：{'、'.join(found)}，未收款已更新"))
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(f"✅ 已紀錄請假：{'、'.join(found)}（未收款已更新）"))
         else:
             line_bot_api.reply_message(event.reply_token, TextSendMessage("⚠️ 沒找到符合的學生名稱"))
         return
@@ -214,10 +212,26 @@ def handle_message(event):
         traceback.print_exc()
         ai_reply = f"AI錯誤：{e}"
 
-    ai_reply = auto_split_lines(ai_reply)
+    # 分段處理＋最多 5 創建，防止 LINE 爆段數
+    segments = ai_reply.split('\n')
+    grouped = []
+    buf = ""
+    for seg in segments:
+        if len(buf) + len(seg) < 1000:
+            buf += seg + '\n'
+        else:
+            grouped.append(buf.strip())
+            buf = seg
+    if buf:
+        grouped.append(buf.strip())
+    grouped = grouped[:5]  # LINE 最多只推 5 段
+
     if mongo_ok:
         col.insert_one({"user_id": user_id, "role": "assistant", "content": ai_reply, "time": now})
-    line_bot_api.reply_message(event.reply_token, [TextSendMessage(text=seg) for seg in ai_reply.split('\n')])
+    try:
+        line_bot_api.reply_message(event.reply_token, [TextSendMessage(text=seg) for seg in grouped])
+    except Exception as e:
+        print("❌ LINE 回覆失敗", e)
 
 # ---------- 6. 健康檢查 ----------
 @app.route('/health', methods=['GET'])
