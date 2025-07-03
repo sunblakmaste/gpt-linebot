@@ -1,6 +1,6 @@
 import os
 from dotenv import load_dotenv
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
@@ -94,14 +94,16 @@ def get_user_state(user_id):
             "must_do": latest.get("must_do", ["倒垃圾", "核對金流", "洗澡"]),
             "time_core": latest.get("time_core", "核心時段：6-10 睡眠, 10-18 工作, 18-24 彈性"),
             "money_safe_line": latest.get("safe_line", 20000),
-            "students": latest.get("students", [])
+            "students": latest.get("students", []),
+            "teaching_logs": latest.get("teaching_logs", [])
         }
     return {
         "energy": 70, "physical": 70, "money_alert": False,
         "must_do": ["倒垃圾", "核對金流", "洗澡"],
         "time_core": "核心時段：6-10 睡眠, 10-18 工作, 18-24 彈性",
         "money_safe_line": 20000,
-        "students": []
+        "students": [],
+        "teaching_logs": []
     }
 
 def update_user_state(user_id, energy, physical):
@@ -124,6 +126,15 @@ def check_money_alert(user_id):
     profile_col.update_one({"user_id": user_id}, {"$set": {"money_alert": alert}})
     return alert
 
+def check_teaching_log_reminder(user_id):
+    tz = pytz.timezone('Asia/Taipei')
+    yesterday = datetime.now(tz).date() - timedelta(days=1)
+    logs = profile_col.find_one({"user_id": user_id}).get("teaching_logs", [])
+    for log in logs:
+        if log.get("date") == str(yesterday):
+            return ""
+    return f"⚠️ 提醒：你昨天（{yesterday}）沒有登錄教學紀錄，是否要補上？"
+
 def get_daily_summary(user_id):
     if not mongo_ok:
         return "（無法生成今日摘要）"
@@ -132,7 +143,7 @@ def get_daily_summary(user_id):
     start = tz.localize(datetime.combine(today, datetime.min.time()))
     msgs = list(col.find({"user_id": user_id, "time": {"$gte": start}}))
     modules_done = [m['content'] for m in msgs if m['role'] == 'assistant']
-    return f"📅 今日摘要：已完成 {len(modules_done)} 條互動，請回顧必做底線是否執行！"
+    return f"📅 今日摘要：已完成 {len(modules_done)} 條互動"
 
 def get_monthly_summary(user_id):
     if not mongo_ok:
@@ -141,7 +152,7 @@ def get_monthly_summary(user_id):
     today = datetime.now(tz)
     first_day = tz.localize(today.replace(day=1))
     msgs = list(col.find({"user_id": user_id, "time": {"$gte": first_day}}))
-    return f"📅 本月摘要：累計對話 {len(msgs)} 條，請留意現金流安全線！"
+    return f"📅 本月摘要：累計對話 {len(msgs)} 條"
 
 # ---------- 5. Webhook ----------
 @app.route("/callback", methods=['POST'])
@@ -174,21 +185,34 @@ def handle_message(event):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(f"💰 已紀錄收入 +{amount} 元"))
         return
 
+    user_state = get_user_state(user_id)
+
     if "請假" in user_message:
-        user_state = get_user_state(user_id)
         students = user_state.get('students', [])
         found = [s['name'] for s in students if s['name'] in user_message]
         if found:
             line_bot_api.reply_message(event.reply_token, TextSendMessage(f"✅ 已紀錄請假：{'、'.join(found)}"))
         else:
-            line_bot_api.reply_message(event.reply_token, TextSendMessage("⚠️ 沒找到符合的學生名稱！"))
+            line_bot_api.reply_message(event.reply_token, TextSendMessage("⚠️ 沒找到符合的學生名稱"))
+        return
+
+    teaching_match = re.search(r"(.*?)教了(\d+)小時", user_message)
+    if teaching_match:
+        student_name = teaching_match.group(1).strip()
+        hours = int(teaching_match.group(2))
+        tz = pytz.timezone('Asia/Taipei')
+        today = str(datetime.now(tz).date())
+        profile_col.update_one({"user_id": user_id}, {"$push": {"teaching_logs": {"name": student_name, "hours": hours, "date": today}}})
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(f"✅ 已紀錄：{student_name} 上課 {hours} 小時"))
         return
 
     if mongo_ok:
         col.insert_one({"user_id": user_id, "role": "user", "content": user_message, "time": now})
 
-    user_state = get_user_state(user_id)
     check_money_alert(user_id)
+    money_message = ""
+    if user_state['money_alert']:
+        money_message = "\n⚡️ 建議啟動快現金模組：短期補充收入來源！"
 
     modules = []
     if user_state['energy'] > 70:
@@ -208,6 +232,7 @@ def handle_message(event):
     )
     daily = get_daily_summary(user_id)
     monthly = get_monthly_summary(user_id)
+    teaching_reminder = check_teaching_log_reminder(user_id)
 
     system_prompt = (
         f"你是小老虎AI，專屬於蘇有維，真實、溫暖、彈性結構化陪跑。\n"
@@ -216,6 +241,7 @@ def handle_message(event):
         f"{structure_summary}\n"
         f"📌 今日推薦模組：{modules}\n"
         f"{daily}\n{monthly}\n"
+        f"{teaching_reminder}{money_message}\n"
         "請結合用戶訊息與狀態，給予實用安排，並帶一句暖心提醒！"
     )
 
