@@ -1,8 +1,8 @@
-Flask
-gunicorn
-line-bot-sdk
-openai>=1.0.0
-pymongo
-python-dotenv
-pytz
-requests
+Flask==2.3.2
+gunicorn==21.2.0
+line-bot-sdk==2.4.2
+openai>=1.11.0
+pymongo==4.6.1
+python-dotenv==1.0.1
+pytz==2024.1
+requests==2.31.0
