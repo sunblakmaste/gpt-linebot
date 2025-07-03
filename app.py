@@ -1,6 +1,6 @@
 import os
 from dotenv import load_dotenv
-from datetime import datetime, timedelta
+from datetime import datetime
 import pytz
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
@@ -32,7 +32,7 @@ try:
     profile_col = db['profiles']
     mongo_ok = True
 except Exception as e:
-    print("❌ MongoDB或其他初始化失敗：", e)
+    print("❌ 初始化失敗：", e)
     mongo_ok = False
 
 # ---------- 3. 工具 ----------
@@ -93,13 +93,15 @@ def get_user_state(user_id):
             "money_alert": latest.get("money_alert", False),
             "must_do": latest.get("must_do", ["倒垃圾", "核對金流", "洗澡"]),
             "time_core": latest.get("time_core", "核心時段：6-10 睡眠, 10-18 工作, 18-24 彈性"),
-            "money_safe_line": latest.get("safe_line", 20000)
+            "money_safe_line": latest.get("safe_line", 20000),
+            "students": latest.get("students", [])
         }
     return {
         "energy": 70, "physical": 70, "money_alert": False,
         "must_do": ["倒垃圾", "核對金流", "洗澡"],
         "time_core": "核心時段：6-10 睡眠, 10-18 工作, 18-24 彈性",
-        "money_safe_line": 20000
+        "money_safe_line": 20000,
+        "students": []
     }
 
 def update_user_state(user_id, energy, physical):
@@ -128,10 +130,7 @@ def get_daily_summary(user_id):
     tz = pytz.timezone('Asia/Taipei')
     today = datetime.now(tz).date()
     start = tz.localize(datetime.combine(today, datetime.min.time()))
-    msgs = list(col.find({
-        "user_id": user_id,
-        "time": {"$gte": start}
-    }))
+    msgs = list(col.find({"user_id": user_id, "time": {"$gte": start}}))
     modules_done = [m['content'] for m in msgs if m['role'] == 'assistant']
     return f"📅 今日摘要：已完成 {len(modules_done)} 條互動，請回顧必做底線是否執行！"
 
@@ -141,10 +140,7 @@ def get_monthly_summary(user_id):
     tz = pytz.timezone('Asia/Taipei')
     today = datetime.now(tz)
     first_day = tz.localize(today.replace(day=1))
-    msgs = list(col.find({
-        "user_id": user_id,
-        "time": {"$gte": first_day}
-    }))
+    msgs = list(col.find({"user_id": user_id, "time": {"$gte": first_day}}))
     return f"📅 本月摘要：累計對話 {len(msgs)} 條，請留意現金流安全線！"
 
 # ---------- 5. Webhook ----------
@@ -165,21 +161,27 @@ def handle_message(event):
     now, now_str, period = get_time_string()
     weather_str = get_taipei_weather()
 
-    # 狀態手動更新
     if "狀態：" in user_message:
         match = re.match(r"狀態：(\d{1,3})/(\d{1,3})", user_message)
         if match:
-            energy = int(match.group(1))
-            physical = int(match.group(2))
-            update_user_state(user_id, energy, physical)
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(f"✅ 已更新狀態：精神{energy} 體力{physical}"))
+            update_user_state(user_id, int(match.group(1)), int(match.group(2)))
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(f"✅ 已更新狀態：精神{match.group(1)} 體力{match.group(2)}"))
             return
 
-    # 自動收入記帳（範例）
     if "收到" in user_message and re.search(r"\d+元", user_message):
         amount = int(re.search(r"(\d+)元", user_message).group(1))
         profile_col.update_one({"user_id": user_id}, {"$inc": {"income_this_month": amount}})
         line_bot_api.reply_message(event.reply_token, TextSendMessage(f"💰 已紀錄收入 +{amount} 元"))
+        return
+
+    if "請假" in user_message:
+        user_state = get_user_state(user_id)
+        students = user_state.get('students', [])
+        found = [s['name'] for s in students if s['name'] in user_message]
+        if found:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(f"✅ 已紀錄請假：{'、'.join(found)}"))
+        else:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage("⚠️ 沒找到符合的學生名稱！"))
         return
 
     if mongo_ok:
@@ -214,7 +216,7 @@ def handle_message(event):
         f"{structure_summary}\n"
         f"📌 今日推薦模組：{modules}\n"
         f"{daily}\n{monthly}\n"
-        "請結合用戶訊息與狀態，回應具體結構安排，並帶一句暖心提醒。"
+        "請結合用戶訊息與狀態，給予實用安排，並帶一句暖心提醒！"
     )
 
     try:
