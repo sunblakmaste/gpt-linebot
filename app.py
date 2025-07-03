@@ -10,6 +10,7 @@ from pymongo import MongoClient
 import openai
 import requests
 import re
+import traceback
 
 # ---------- 1. 讀取環境變數 ----------
 load_dotenv()
@@ -31,7 +32,7 @@ try:
     profile_col = db['profiles']
     mongo_ok = True
 except Exception as e:
-    print("MongoDB初始化失敗：", e)
+    print("❌ MongoDB或其他初始化失敗：", e)
     mongo_ok = False
 
 # ---------- 3. 工具 ----------
@@ -124,24 +125,27 @@ def check_money_alert(user_id):
 def get_daily_summary(user_id):
     if not mongo_ok:
         return "（無法生成今日摘要）"
-    today = datetime.now(pytz.timezone('Asia/Taipei')).date()
+    tz = pytz.timezone('Asia/Taipei')
+    today = datetime.now(tz).date()
+    start = tz.localize(datetime.combine(today, datetime.min.time()))
     msgs = list(col.find({
         "user_id": user_id,
-        "time": {"$gte": datetime.combine(today, datetime.min.time(), pytz.timezone('Asia/Taipei'))}
+        "time": {"$gte": start}
     }))
     modules_done = [m['content'] for m in msgs if m['role'] == 'assistant']
-    return f"📅 今日摘要：已完成 {len(modules_done)} 條互動，核心完成度請回顧必做底線任務是否執行完畢！"
+    return f"📅 今日摘要：已完成 {len(modules_done)} 條互動，請回顧必做底線是否執行！"
 
 def get_monthly_summary(user_id):
     if not mongo_ok:
         return "（無法生成月摘要）"
-    today = datetime.now(pytz.timezone('Asia/Taipei'))
-    first_day = today.replace(day=1)
+    tz = pytz.timezone('Asia/Taipei')
+    today = datetime.now(tz)
+    first_day = tz.localize(today.replace(day=1))
     msgs = list(col.find({
         "user_id": user_id,
         "time": {"$gte": first_day}
     }))
-    return f"📅 本月摘要：累計對話 {len(msgs)} 條，請特別關注現金流是否低於安全線！"
+    return f"📅 本月摘要：累計對話 {len(msgs)} 條，請留意現金流安全線！"
 
 # ---------- 5. Webhook ----------
 @app.route("/callback", methods=['POST'])
@@ -168,17 +172,22 @@ def handle_message(event):
             energy = int(match.group(1))
             physical = int(match.group(2))
             update_user_state(user_id, energy, physical)
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(f"已更新狀態：精神{energy} 體力{physical}"))
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(f"✅ 已更新狀態：精神{energy} 體力{physical}"))
             return
+
+    # 自動收入記帳（範例）
+    if "收到" in user_message and re.search(r"\d+元", user_message):
+        amount = int(re.search(r"(\d+)元", user_message).group(1))
+        profile_col.update_one({"user_id": user_id}, {"$inc": {"income_this_month": amount}})
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(f"💰 已紀錄收入 +{amount} 元"))
+        return
 
     if mongo_ok:
         col.insert_one({"user_id": user_id, "role": "user", "content": user_message, "time": now})
 
-    # 取狀態 + 檢查金流
     user_state = get_user_state(user_id)
     check_money_alert(user_id)
 
-    # 建議模組（四層結構核心）
     modules = []
     if user_state['energy'] > 70:
         modules += ["高專注備課", "重大決策", "創意策劃"]
@@ -186,30 +195,26 @@ def handle_message(event):
         modules += ["學生聯繫", "環境整理"]
     else:
         modules += ["金流檢查", "放鬆儀式"]
-
     modules += user_state["must_do"]
     modules = list(set(modules))
 
-    # 四面向底盤
     structure_summary = (
         f"⏰【時間骨架】{user_state['time_core']}\n"
-        f"🧠【精神力】當前 {user_state['energy']}/100\n"
-        f"💪【體力】當前 {user_state['physical']}/100\n"
+        f"🧠【精神力】{user_state['energy']}/100\n"
+        f"💪【體力】{user_state['physical']}/100\n"
         f"💰【金流】安全線 {user_state['money_safe_line']} → {'⚠️ 警戒' if user_state['money_alert'] else '✅ 正常'}"
     )
-
-    # 每日/每月復盤
     daily = get_daily_summary(user_id)
     monthly = get_monthly_summary(user_id)
 
     system_prompt = (
-        f"你是小老虎AI，專屬於蘇有維，真實、溫暖、動態結構化陪跑。\n"
-        f"📍 台北時間：{now_str} {period}\n"
-        f"🌦️ 台北天氣：{weather_str}\n"
+        f"你是小老虎AI，專屬於蘇有維，真實、溫暖、彈性結構化陪跑。\n"
+        f"📍 時間：{now_str} {period}\n"
+        f"🌦️ 天氣：{weather_str}\n"
         f"{structure_summary}\n"
         f"📌 今日推薦模組：{modules}\n"
         f"{daily}\n{monthly}\n"
-        "請根據用戶訊息＋狀態，回應彈性結構安排，並帶一句暖心提醒。"
+        "請結合用戶訊息與狀態，回應具體結構安排，並帶一句暖心提醒。"
     )
 
     try:
@@ -222,6 +227,7 @@ def handle_message(event):
         )
         ai_reply = response.choices[0].message.content.strip()
     except Exception as e:
+        traceback.print_exc()
         ai_reply = f"AI錯誤：{e}"
 
     ai_reply = auto_split_lines(ai_reply)
@@ -229,14 +235,13 @@ def handle_message(event):
         col.insert_one({"user_id": user_id, "role": "assistant", "content": ai_reply, "time": now})
 
     MAX_LEN = 1000
-    reply_segments = [ai_reply[i:i+MAX_LEN] for i in range(0, len(ai_reply), MAX_LEN)]
-    line_bot_api.reply_message(event.reply_token, [TextSendMessage(text=seg) for seg in reply_segments])
+    segments = [ai_reply[i:i+MAX_LEN] for i in range(0, len(ai_reply), MAX_LEN)]
+    line_bot_api.reply_message(event.reply_token, [TextSendMessage(text=seg) for seg in segments])
 
 # ---------- 6. 健康檢查 ----------
 @app.route('/health', methods=['GET'])
 def health():
     return 'ok', 200
 
-# ---------- 7. Run ----------
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=5000)
