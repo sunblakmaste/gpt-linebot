@@ -115,6 +115,8 @@ def check_money_alert(user_id):
     if not mongo_ok:
         return False, ""
     data = profile_col.find_one({"user_id": user_id})
+    if not data:
+        return False, ""
     income = data.get("income_this_month", 0)
     expense = data.get("expense_this_month", 0)
     safe_line = data.get("safe_line", 20000)
@@ -127,7 +129,10 @@ def check_money_alert(user_id):
 def check_teaching_log_reminder(user_id):
     tz = pytz.timezone('Asia/Taipei')
     yesterday = datetime.now(tz).date() - timedelta(days=1)
-    logs = profile_col.find_one({"user_id": user_id}).get("teaching_logs", [])
+    data = profile_col.find_one({"user_id": user_id})
+    logs = []
+    if data and "teaching_logs" in data:
+        logs = data.get("teaching_logs", [])
     for log in logs:
         if log.get("date") == str(yesterday):
             return ""
